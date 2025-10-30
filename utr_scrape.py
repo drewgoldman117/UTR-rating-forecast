@@ -1,17 +1,18 @@
 import os
 import re
 import argparse
+from pathlib import Path
+from typing import Optional
+
 import pandas as pd
 from bs4 import BeautifulSoup
-from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-FULL_HISTORY_HEADER_CANDIDATES = [
-    "Full Rating History",
-    "Full Ratings History",
-]
+FULL_HISTORY_HEADER_CANDIDATES = ["Full Rating History", "Full Ratings History"]
 
-# ---------- Parsing (HTML -> rows) ----------
+# =========================
+# Parsing (HTML -> rows)
+# =========================
 
 def extract_name_from_title(title: str) -> str:
     if not title:
@@ -21,11 +22,11 @@ def extract_name_from_title(title: str) -> str:
 def parse_full_history_from_html(html: str):
     """
     Parse the 'Full Rating(s) History' section.
-    Returns: [{'date': 'YYYY-MM-DD', 'UTR': '11.87'}, ...]
+    Returns: list of dicts with keys {'date','UTR'}.
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # Anchor near the header if possible
+    # Try to anchor near the header
     header_node = None
     for node in soup.find_all(string=True):
         text = (node or "").strip()
@@ -83,39 +84,38 @@ def parse_full_history_from_html(html: str):
             uniq.append(r)
     return uniq
 
-# ---------- Playwright helpers ----------
+# =========================
+# Diagnostics (optional)
+# =========================
 
-def try_fill_login_in_context(query_ctx, email: str, password: str) -> bool:
-    """
-    Fill email/password in the login form (#emailInput/#passwordInput) and click SIGN IN.
-    """
+def enable_diagnostics(context, page, out_dir="diagnostics"):
+    os.makedirs(out_dir, exist_ok=True)
     try:
-        email_input = query_ctx.locator("#emailInput, input[type='email']").first
-        pwd_input   = query_ctx.locator("#passwordInput, input[type='password']").first
-
-        if email_input.count() == 0 or pwd_input.count() == 0:
-            return False
-
-        email_input.wait_for(state="visible", timeout=5000)
-        pwd_input.wait_for(state="visible", timeout=5000)
-
-        email_input.fill(email)
-        pwd_input.fill(password)
-
-        sign_in_btn = query_ctx.locator("button[type='submit']:has-text('SIGN IN')")
-        if sign_in_btn.count() == 0:
-            sign_in_btn = query_ctx.locator(
-                "button:has-text('SIGN IN'), button:has-text('Sign in'), button:has-text('Sign In')"
-            )
-
-        if sign_in_btn.count() > 0:
-            sign_in_btn.first.click()
-        else:
-            (getattr(query_ctx, "page", query_ctx)).keyboard.press("Enter")
-
-        return True
+        context.tracing.start(screenshots=True, snapshots=True, sources=True)
     except Exception:
-        return False
+        pass
+    # NOTE: use .type and .text as PROPERTIES (no parentheses)
+    page.on("console", lambda msg: print(f"[console.{msg.type}] {msg.text}"))
+    page.on("pageerror", lambda exc: print(f"[pageerror] {exc}"))
+
+def save_diagnostics(page, step):
+    try:
+        path = f"diagnostics/{step}.png"
+        page.screenshot(path=path, full_page=True)
+        print(f"[diag] screenshot -> {path}")
+    except Exception as e:
+        print(f"[diag] screenshot failed ({step}): {e}")
+
+def stop_tracing(context):
+    try:
+        context.tracing.stop(path="diagnostics/trace.zip")
+        print("[diag] trace -> diagnostics/trace.zip")
+    except Exception as e:
+        print(f"[diag] trace stop failed: {e}")
+
+# =========================
+# Playwright helpers
+# =========================
 
 def click_overlay_sign_in_if_present(page, timeout_ms=8000) -> bool:
     """
@@ -136,7 +136,7 @@ def click_overlay_sign_in_if_present(page, timeout_ms=8000) -> bool:
         root = overlay.first
         sign_in = root.locator("button.btn.btn-primary-inv:has-text('Sign In')")
         if sign_in.count() == 0:
-            sign_in = root.locator("button:has-text('Sign In'), button:has-text('Sign in')")
+            sign_in = root.locator("button:has-text('Sign In'), button:has-text('Sign in'), button:has-text('Sign-In')")
         if sign_in.count() > 0:
             sign_in.first.click()
             try:
@@ -144,43 +144,124 @@ def click_overlay_sign_in_if_present(page, timeout_ms=8000) -> bool:
             except Exception:
                 page.wait_for_timeout(300)
             return True
-
         return False
     except Exception:
         return False
 
-def login_if_needed(page, email: str, password: str) -> bool:
-    if not email or not password:
+def wait_for_login_form(page, timeout_ms=8000) -> bool:
+    """Wait for the login form to appear after clicking overlay Sign In."""
+    try:
+        page.wait_for_function(
+            """() => !!(document.querySelector('#emailInput') || document.querySelector('#passwordInput'))""",
+            timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        try:
+            page.wait_for_selector("input#emailInput, input#passwordInput, input[type='email'], input[type='password']", timeout=2000)
+            return True
+        except Exception:
+            return False
+
+def try_fill_login_in_context(query_ctx, email: str, password: str) -> bool:
+    """
+    Fill email/password and submit inside the given context (page/locator/frame).
+    Uses typing to trigger onChange/onInput handlers.
+    """
+    try:
+        email_loc = query_ctx.locator("#emailInput, input[name='email'], input[type='email']").first
+        pass_loc  = query_ctx.locator("#passwordInput, input[name='password'], input[type='password']").first
+        if email_loc.count() == 0 or pass_loc.count() == 0:
+            return False
+
+        email_loc.wait_for(state="visible", timeout=6000)
+        pass_loc.wait_for(state="visible", timeout=6000)
+
+        # Clear then type (real key events)
+        try: email_loc.fill("")
+        except Exception: pass
+        email_loc.click()
+        email_loc.type(email, delay=20)
+
+        try: pass_loc.fill("")
+        except Exception: pass
+        pass_loc.click()
+        pass_loc.type(password, delay=20)
+
+        # Submit
+        submit = query_ctx.locator("form button[type='submit']:has-text('SIGN IN')").first
+        if submit.count() == 0:
+            submit = query_ctx.locator("button:has-text('SIGN IN'), button:has-text('Sign in'), button:has-text('Sign In')").first
+
+        if submit.count() > 0:
+            try:
+                query_ctx.wait_for_function("""btn => !btn.disabled""", arg=submit, timeout=3000)
+            except Exception:
+                pass
+            submit.click()
+        else:
+            pass_loc.press("Enter")
+
+        return True
+    except Exception:
         return False
 
-    attempted = try_fill_login_in_context(page, email, password)
-    if attempted:
+def login_if_needed(page, email: str, password: str) -> bool:
+    """
+    Tries inline/page login, overlay→login flow, then iframe login.
+    Returns True if an attempt was made.
+    """
+    if not email or not password:
+        return False
+    attempted = False
+
+    # Inline/page-level
+    if try_fill_login_in_context(page, email, password):
+        attempted = True
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:
             page.wait_for_timeout(800)
         return True
 
+    # Overlay → login page or inline
     if click_overlay_sign_in_if_present(page):
-        attempted = try_fill_login_in_context(page, email, password)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except PWTimeout:
-            page.wait_for_timeout(800)
-        if attempted:
-            return True
-
-    # Check if login form is inside an iframe
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
-        if try_fill_login_in_context(frame, email, password):
+        attempted = True
+        wait_for_login_form(page, timeout_ms=8000)
+        if try_fill_login_in_context(page, email, password):
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except PWTimeout:
                 page.wait_for_timeout(800)
             return True
+
+    # Iframe-based
+    try:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            if try_fill_login_in_context(frame, email, password):
+                attempted = True
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except PWTimeout:
+                    page.wait_for_timeout(800)
+                return True
+    except Exception:
+        pass
+
     return attempted
+
+def looks_logged_in(page) -> bool:
+    """Heuristic: if we don't see overlay or login form, assume logged-in."""
+    try:
+        if page.locator("div[class*='popup__overlay']").count() > 0:
+            return False
+        if page.locator("#emailInput, #passwordInput, button:has-text('SIGN IN')").count() > 0:
+            return False
+        return True
+    except Exception:
+        return False
 
 def wait_for_full_history_header(page):
     for txt in FULL_HISTORY_HEADER_CANDIDATES:
@@ -196,15 +277,20 @@ def wait_for_full_history_header(page):
 
 def click_show_all_if_present(page, timeout_ms=8000):
     candidates = [
+        page.get_by_role("button", name=re.compile(r"^\s*show all\s*$", re.I)),
+        page.get_by_role("link", name=re.compile(r"^\s*show all\s*$", re.I)),
         page.locator("button:has-text('Show all')"),
         page.locator("a:has-text('Show all')"),
+        page.locator("text=/^\\s*Show all\\s*$/i"),
     ]
     for loc in candidates:
         try:
             if loc.count() > 0:
+                loc.first.scroll_into_view_if_needed()
                 loc.first.click()
                 try:
                     page.wait_for_timeout(150)
+                    page.wait_for_function("""() => !document.body.innerText.match(/\\bShow\\s+all\\b/i)""", timeout=timeout_ms)
                 except PWTimeout:
                     pass
                 return True
@@ -212,34 +298,83 @@ def click_show_all_if_present(page, timeout_ms=8000):
             continue
     return False
 
-def live_fetch_profile_html(user_id: int, headless: bool = True) -> tuple[str, str]:
+# =========================
+# Live fetch
+# =========================
+
+def live_fetch_profile_html(
+    user_id: int,
+    headless: bool = True,
+    use_storage_state: Optional[str] = None,
+    save_storage_state_to: Optional[str] = None
+) -> tuple[str, str]:
+    """
+    Navigate to profile, ensure auth, expand 'Show all', return (html, title).
+    """
     profile_url = f"https://app.utrsports.net/profiles/{user_id}?t=6"
     email = os.getenv("UTR_EMAIL", "").strip()
     password = os.getenv("UTR_PASSWORD", "").strip()
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
-        context = browser.new_context()
+        context_kwargs = {}
+        if use_storage_state and os.path.exists(use_storage_state):
+            context_kwargs["storage_state"] = use_storage_state
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
-        page.set_default_timeout(10000)
 
+        # Diagnostics
+        enable_diagnostics(context, page)
+
+        # Reasonable defaults
+        page.set_default_timeout(15000)
+        page.set_default_navigation_timeout(20000)
+
+        # 1) Go to profile
         page.goto(profile_url, wait_until="domcontentloaded")
+        save_diagnostics(page, "01_after_profile_nav")
 
-        if email and password:
+        # 2) Auth if needed
+        if email and password and not looks_logged_in(page):
             click_overlay_sign_in_if_present(page)
+            save_diagnostics(page, "02_after_click_overlay_sign_in")
+
+            wait_for_login_form(page, timeout_ms=8000)
+            save_diagnostics(page, "03_login_form_visible")
+
             login_if_needed(page, email, password)
+            save_diagnostics(page, "04_after_login_submit")
+
             page.goto(profile_url, wait_until="domcontentloaded")
+            save_diagnostics(page, "05_after_reload_profile")
 
+            # Optionally persist session
+            if save_storage_state_to:
+                try:
+                    context.storage_state(path=save_storage_state_to)
+                    print(f"[diag] saved storage state -> {save_storage_state_to}")
+                except Exception as e:
+                    print(f"[diag] save storage state failed: {e}")
+
+        # 3) Wait for history header and expand
         wait_for_full_history_header(page)
-        click_show_all_if_present(page)
+        save_diagnostics(page, "06_after_wait_history_header")
 
+        click_show_all_if_present(page)
+        save_diagnostics(page, "07_after_click_show_all")
+
+        # 4) Return content
         title = page.title()
         html = page.content()
+
+        stop_tracing(context)
         context.close()
         browser.close()
         return html, title
 
-# ---------- Output ----------
+# =========================
+# Output
+# =========================
 
 def write_csv(user_id: int, player_name: str, rows: list[dict], out_path: str):
     df = pd.DataFrame(rows)
@@ -249,16 +384,20 @@ def write_csv(user_id: int, player_name: str, rows: list[dict], out_path: str):
     df.insert(0, "player_name", player_name)
     df.insert(0, "user_id", user_id)
     df.to_csv(out_path, index=False)
-    print(f"Wrote {len(df)} rows → {out_path}")
+    print(f"Wrote {len[df]} rows → {out_path}")
 
-# ---------- CLI ----------
+# =========================
+# CLI
+# =========================
 
 def main():
     ap = argparse.ArgumentParser(description="Fetch UTR Full Rating History to CSV")
-    ap.add_argument("--user-id", type=int, required=True)
-    ap.add_argument("--out", type=str, default="utr_history.csv")
+    ap.add_argument("--user-id", type=int, required=True, help="UTR user id (e.g., 119061)")
+    ap.add_argument("--out", type=str, default="utr_history.csv", help="Output CSV path")
     ap.add_argument("--html", type=str, help="Parse from a saved HTML file instead of live site")
-    ap.add_argument("--headed", action="store_true", help="Run browser with UI")
+    ap.add_argument("--headed", action="store_true", help="Run browser with UI (non-headless)")
+    ap.add_argument("--use-storage", type=str, help="Path to storage state JSON to reuse session (optional)")
+    ap.add_argument("--save-storage", type=str, help="Path to save storage state after login (optional)")
     args = ap.parse_args()
 
     if args.html:
@@ -269,7 +408,12 @@ def main():
         write_csv(args.user_id, player_name, rows, args.out)
         return
 
-    html, title = live_fetch_profile_html(args.user_id, headless=(not args.headed))
+    html, title = live_fetch_profile_html(
+        args.user_id,
+        headless=(not args.headed),
+        use_storage_state=args.use_storage,
+        save_storage_state_to=args.save_storage
+    )
     player_name = extract_name_from_title(title)
     rows = parse_full_history_from_html(html)
     write_csv(args.user_id, player_name, rows, args.out)
